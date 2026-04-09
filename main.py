@@ -263,6 +263,7 @@ def root():
         "message": "Estatisticas Futebol API online",
     }
 
+
 @app.get("/matches/daily")
 async def get_daily_matches(
     match_date: date = Query(..., description="Data YYYY-MM-DD"),
@@ -296,6 +297,9 @@ async def get_daily_matches(
         country_name = event.get("strCountry", "")
         home = event.get("strHomeTeam", "")
         away = event.get("strAwayTeam", "")
+
+        if not home or not away:
+            continue
 
         if competition and competition.lower() not in league.lower():
             continue
