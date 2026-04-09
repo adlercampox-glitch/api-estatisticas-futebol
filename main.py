@@ -1,6 +1,7 @@
 from datetime import date, datetime
 from typing import List, Literal, Optional
 
+import httpx
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 
@@ -25,7 +26,17 @@ class MatchAnalysisOptions(BaseModel):
     include_xg: bool = True
     include_odds_analysis: bool = False
     lookback_matches: int = Field(default=10, ge=3, le=20)
-    markets: Optional[List[Literal["1x2", "over_under", "btts", "asian_handicap", "european_handicap"]]] = None
+    markets: Optional[
+        List[
+            Literal[
+                "1x2",
+                "over_under",
+                "btts",
+                "asian_handicap",
+                "european_handicap",
+            ]
+        ]
+    ] = None
     bookmakers: Optional[List[str]] = None
 
 
@@ -95,7 +106,15 @@ class MatchAnalysisResponse(BaseModel):
 
 class OddsComparisonRequest(BaseModel):
     matches: List[MatchRef]
-    markets: List[Literal["1x2", "over_under", "btts", "asian_handicap", "european_handicap"]]
+    markets: List[
+        Literal[
+            "1x2",
+            "over_under",
+            "btts",
+            "asian_handicap",
+            "european_handicap",
+        ]
+    ]
     bookmakers: Optional[List[str]] = None
 
 
@@ -109,6 +128,29 @@ class OddsComparisonItem(BaseModel):
 class OddsComparisonResponse(BaseModel):
     generated_at: datetime
     matches: List[OddsComparisonItem]
+
+
+class MatchRankRequest(BaseModel):
+    matches: List[MatchAnalysisItem]
+    rank_by: Literal[
+        "expected_total_goals",
+        "handicap_strength_diff",
+        "reading_risk",
+        "confidence",
+    ]
+
+
+class MatchRankEntry(BaseModel):
+    rank: int
+    match: MatchRef
+    value: float
+    label: str
+
+
+class MatchRankResponse(BaseModel):
+    generated_at: datetime
+    rank_by: str
+    ranking: List[MatchRankEntry]
 
 
 def classify_goal_profile(total_goals: float) -> str:
@@ -134,7 +176,7 @@ def build_mock_metrics(home_team: str, away_team: str) -> MatchMetrics:
     modifier = ((len(home_team) - len(away_team)) % 5) * 0.08
 
     home_xg = round(base_home + modifier, 2)
-    away_xg = round(base_away - (modifier / 2), 2)
+    away_xg = round(max(0.2, base_away - (modifier / 2)), 2)
     total_xg = round(home_xg + away_xg, 2)
     diff = round(home_xg - away_xg, 2)
 
@@ -169,7 +211,7 @@ def build_mock_odds_analysis(markets: Optional[List[str]] = None) -> OddsAnalysi
                 consensus_position="above_market",
                 bookmaker_best="Book A",
                 bookmaker_worst="Book B",
-                market_comment="Linha acima do consenso médio entre operadores."
+                market_comment="Linha acima do consenso médio entre operadores.",
             )
         )
 
@@ -188,7 +230,7 @@ def build_mock_odds_analysis(markets: Optional[List[str]] = None) -> OddsAnalysi
                 consensus_position="above_market",
                 bookmaker_best="Book C",
                 bookmaker_worst="Book D",
-                market_comment="Preço acima da média do mercado."
+                market_comment="Preço acima da média do mercado.",
             )
         )
 
@@ -207,7 +249,7 @@ def build_mock_odds_analysis(markets: Optional[List[str]] = None) -> OddsAnalysi
                 consensus_position="near_consensus",
                 bookmaker_best="Book A",
                 bookmaker_worst="Book C",
-                market_comment="Mercado próximo do consenso, com dispersão moderada."
+                market_comment="Mercado próximo do consenso, com dispersão moderada.",
             )
         )
 
@@ -218,44 +260,66 @@ def build_mock_odds_analysis(markets: Optional[List[str]] = None) -> OddsAnalysi
 def root():
     return {
         "status": "ok",
-        "message": "Estatisticas Futebol API online"
+        "message": "Estatisticas Futebol API online",
     }
 
 
 @app.get("/matches/daily")
-def get_daily_matches(
+async def get_daily_matches(
     match_date: date = Query(..., description="Data YYYY-MM-DD"),
     country: Optional[str] = Query(None),
     competition: Optional[str] = Query(None),
-    limit: int = Query(20, ge=1, le=100)
+    limit: int = Query(20, ge=1, le=100),
 ):
-    sample_matches = [
-        {
-            "home_team": "Flamengo",
-            "away_team": "Palmeiras",
-            "competition": competition or "Serie A",
-            "match_date": match_date,
-            "country": country or "Brazil",
-        },
-        {
-            "home_team": "Liverpool",
-            "away_team": "Arsenal",
-            "competition": competition or "Premier League",
-            "match_date": match_date,
-            "country": country or "England",
-        },
-        {
-            "home_team": "Barcelona",
-            "away_team": "Atletico Madrid",
-            "competition": competition or "La Liga",
-            "match_date": match_date,
-            "country": country or "Spain",
-        },
-    ]
+    url = "https://www.thesportsdb.com/api/v1/json/123/eventsday.php"
+    params = {
+        "d": match_date.isoformat(),
+        "s": "Soccer",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(url, params=params)
+
+    if response.status_code != 200:
+        return {
+            "generated_at": datetime.utcnow(),
+            "matches": [],
+            "error": f"Falha ao buscar jogos. status_code={response.status_code}",
+        }
+
+    data = response.json()
+    events = data.get("events") or []
+
+    matches = []
+
+    for event in events:
+        league = event.get("strLeague", "")
+        country_name = event.get("strCountry", "")
+        home = event.get("strHomeTeam", "")
+        away = event.get("strAwayTeam", "")
+
+        if competition and competition.lower() not in league.lower():
+            continue
+
+        if country and country.lower() not in country_name.lower():
+            continue
+
+        matches.append(
+            {
+                "home_team": home,
+                "away_team": away,
+                "competition": league,
+                "match_date": match_date,
+                "country": country_name or None,
+            }
+        )
+
+        if len(matches) >= limit:
+            break
 
     return {
         "generated_at": datetime.utcnow(),
-        "matches": sample_matches[:limit]
+        "matches": matches,
     }
 
 
@@ -269,7 +333,7 @@ def analyze_matches(payload: MatchAnalysisRequest):
         classifications = MatchClassifications(
             goal_profile=classify_goal_profile(metrics.expected_total_goals),
             technical_gap=classify_technical_gap(metrics.handicap_strength_diff),
-            reading_risk="medium"
+            reading_risk="medium",
         )
 
         odds_analysis = None
@@ -283,19 +347,25 @@ def analyze_matches(payload: MatchAnalysisRequest):
                 context=MatchContext(
                     injury_impact="unknown",
                     rotation_risk="medium",
-                    recent_form_summary=f"{match.home_team} e {match.away_team} analisados com base mockada inicial.",
-                    style_summary=f"Leitura preliminar de {match.home_team} x {match.away_team} com projeção estatística simplificada."
+                    recent_form_summary=(
+                        f"{match.home_team} e {match.away_team} analisados "
+                        "com base estatística simplificada."
+                    ),
+                    style_summary=(
+                        f"Leitura preliminar de {match.home_team} x {match.away_team} "
+                        "com projeção estatística simplificada."
+                    ),
                 ),
                 classifications=classifications,
                 odds_analysis=odds_analysis,
                 confidence="medium",
-                source_summary=["mock_engine", "initial_model"]
+                source_summary=["thesportsdb_daily", "initial_model"],
             )
         )
 
     return MatchAnalysisResponse(
         generated_at=datetime.utcnow(),
-        matches=results
+        matches=results,
     )
 
 
@@ -309,11 +379,46 @@ def compare_odds(payload: OddsComparisonRequest):
                 match=match,
                 odds_analysis=build_mock_odds_analysis(payload.markets),
                 confidence="medium",
-                source_summary=["mock_market_engine"]
+                source_summary=["mock_market_engine"],
             )
         )
 
     return OddsComparisonResponse(
         generated_at=datetime.utcnow(),
-        matches=results
+        matches=results,
+    )
+
+
+@app.post("/matches/rank", response_model=MatchRankResponse)
+def rank_matches(payload: MatchRankRequest):
+    def score(item: MatchAnalysisItem) -> float:
+        if payload.rank_by == "expected_total_goals":
+            return float(item.metrics.expected_total_goals)
+        if payload.rank_by == "handicap_strength_diff":
+            return abs(float(item.metrics.handicap_strength_diff))
+        if payload.rank_by == "reading_risk":
+            mapping = {"low": 1.0, "medium": 2.0, "high": 3.0}
+            return mapping[item.classifications.reading_risk]
+        if payload.rank_by == "confidence":
+            mapping = {"low": 1.0, "medium": 2.0, "high": 3.0}
+            return mapping[item.confidence]
+        return 0.0
+
+    ordered = sorted(payload.matches, key=score, reverse=True)
+
+    ranking: List[MatchRankEntry] = []
+    for idx, item in enumerate(ordered, start=1):
+        ranking.append(
+            MatchRankEntry(
+                rank=idx,
+                match=item.match,
+                value=score(item),
+                label=payload.rank_by,
+            )
+        )
+
+    return MatchRankResponse(
+        generated_at=datetime.utcnow(),
+        rank_by=payload.rank_by,
+        ranking=ranking,
     )
