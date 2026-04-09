@@ -263,7 +263,6 @@ def root():
         "message": "Estatisticas Futebol API online",
     }
 
-
 @app.get("/matches/daily")
 async def get_daily_matches(
     match_date: date = Query(..., description="Data YYYY-MM-DD"),
